@@ -1,0 +1,2 @@
+# rinzlib
+RinOS用zlib
