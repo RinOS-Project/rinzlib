@@ -11,6 +11,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "rinz_checksum.h"
+
 /* ═══════════════════════════════════════════════════════════════
  * 定数
  * ═══════════════════════════════════════════════════════════════*/
@@ -87,6 +89,8 @@ typedef struct {
 
 /* ハフマンテーブル構築 */
 static inline int rinz_huff_build(RinzHuffTable* h, const uint8_t* lens, int n) {
+    if (h == NULL || lens == NULL || n < 0 || n > RINZ_MAX_CODES)
+        return RINZ_ERROR;
     /* カウント初期化 */
     for (int i = 0; i < RINZ_MAX_BITS; i++) h->counts[i] = 0;
     
@@ -208,9 +212,9 @@ typedef struct {
 
 /* 非圧縮ブロック */
 static inline int rinz_inflate_stored(RinzBitStream* bs, RinzOutput* out) {
+    if (bs == NULL || out == NULL || bs->src_pos > bs->src_size ||
+        bs->src_size - bs->src_pos < 4u) return RINZ_DATA_ERROR;
     rinz_bs_align(bs);
-    
-    if (bs->src_pos + 4 > bs->src_size) return RINZ_DATA_ERROR;
     
     uint16_t len = bs->src[bs->src_pos] | (bs->src[bs->src_pos + 1] << 8);
     uint16_t nlen = bs->src[bs->src_pos + 2] | (bs->src[bs->src_pos + 3] << 8);
@@ -218,8 +222,11 @@ static inline int rinz_inflate_stored(RinzBitStream* bs, RinzOutput* out) {
     
     if ((uint16_t)~nlen != len) return RINZ_DATA_ERROR;
     
-    if (bs->src_pos + len > bs->src_size) return RINZ_DATA_ERROR;
-    if (out->out_pos + len > out->out_size) return RINZ_BUF_ERROR;
+    if ((size_t)len > bs->src_size - bs->src_pos)
+        return RINZ_DATA_ERROR;
+    if (out->out_pos > out->out_size ||
+        (size_t)len > out->out_size - out->out_pos ||
+        (len != 0u && out->out == NULL)) return RINZ_BUF_ERROR;
     
     for (uint16_t i = 0; i < len; i++) {
         out->out[out->out_pos++] = bs->src[bs->src_pos++];
@@ -237,7 +244,8 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
         
         if (sym < 256) {
             /* リテラル */
-            if (out->out_pos >= out->out_size) return RINZ_BUF_ERROR;
+            if (out->out_pos >= out->out_size || out->out == NULL)
+                return RINZ_BUF_ERROR;
             out->out[out->out_pos++] = (uint8_t)sym;
         } else if (sym == 256) {
             /* ブロック終端 */
@@ -261,7 +269,8 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
             }
             
             if (distance > (int)out->out_pos) return RINZ_DATA_ERROR;
-            if (out->out_pos + length > out->out_size) return RINZ_BUF_ERROR;
+            if ((size_t)length > out->out_size - out->out_pos ||
+                out->out == NULL) return RINZ_BUF_ERROR;
             
             /* バックリファレンスコピー */
             for (int i = 0; i < length; i++) {
@@ -338,9 +347,15 @@ static inline int rinz_inflate_dynamic(RinzBitStream* bs,
 /*
  * raw deflate展開 (zlibヘッダーなし)
  */
-static inline int rinz_inflate_raw(const uint8_t* src, size_t src_size,
-                                    uint8_t* dst, size_t dst_size,
-                                    size_t* out_size) {
+static inline void rinz_clear_output(uint8_t* dst, size_t dst_size) {
+    size_t index;
+    if (dst == NULL) return;
+    for (index = 0u; index < dst_size; ++index) dst[index] = 0u;
+}
+
+static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
+                                         uint8_t* dst, size_t dst_size,
+                                         size_t* out_size) {
     rinz_init_fixed_tables();
     
     RinzBitStream bs;
@@ -382,31 +397,79 @@ static inline int rinz_inflate_raw(const uint8_t* src, size_t src_size,
     return RINZ_OK;
 }
 
+static inline int rinz_inflate_raw(const uint8_t* src, size_t src_size,
+                                    uint8_t* dst, size_t dst_size,
+                                    size_t* out_size) {
+    int result;
+    if (out_size != NULL) *out_size = 0u;
+    if ((src == NULL && src_size != 0u) ||
+        (dst == NULL && dst_size != 0u)) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_ERROR;
+    }
+    result = rinz_inflate_raw_impl(src, src_size, dst, dst_size, out_size);
+    if (result != RINZ_OK) {
+        if (out_size != NULL) *out_size = 0u;
+        rinz_clear_output(dst, dst_size);
+    }
+    return result;
+}
+
 /*
  * zlib形式展開 (2バイトヘッダー付き)
  */
 static inline int rinz_inflate(const uint8_t* src, size_t src_size,
                                 uint8_t* dst, size_t dst_size,
                                 size_t* out_size) {
-    if (src_size < 2) return RINZ_DATA_ERROR;
+    size_t offset = 2u;
+    size_t payload_size;
+    size_t decoded_size = 0u;
+    uint32_t expected_adler;
+    int result;
+    if (out_size != NULL) *out_size = 0u;
+    if (src == NULL || src_size < 6u ||
+        (dst == NULL && dst_size != 0u)) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_ERROR;
+    }
     
     /* zlibヘッダー確認 */
     uint8_t cmf = src[0];
     uint8_t flg = src[1];
     
-    if ((cmf & 0x0F) != 8) return RINZ_DATA_ERROR;  /* deflate以外 */
-    if ((cmf * 256 + flg) % 31 != 0) return RINZ_DATA_ERROR;  /* チェック失敗 */
+    if ((cmf & 0x0F) != 8) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_DATA_ERROR;
+    }  /* deflate以外 */
+    if ((cmf * 256 + flg) % 31 != 0) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_DATA_ERROR;
+    }  /* チェック失敗 */
     
     /* ヘッダーをスキップ */
-    size_t offset = 2;
     if (flg & 0x20) {
-        /* FDICT (プリセット辞書) - スキップ */
-        offset += 4;
+        /* A preset dictionary is not part of this allocation-free API. */
+        rinz_clear_output(dst, dst_size);
+        return RINZ_DATA_ERROR;
     }
-    
-    if (offset >= src_size) return RINZ_DATA_ERROR;
-    
-    return rinz_inflate_raw(src + offset, src_size - offset - 4, dst, dst_size, out_size);
+    if (src_size - offset < 4u) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_DATA_ERROR;
+    }
+    payload_size = src_size - offset - 4u;
+    result = rinz_inflate_raw(src + offset, payload_size, dst, dst_size,
+                              &decoded_size);
+    if (result != RINZ_OK) return result;
+    expected_adler = ((uint32_t)src[src_size - 4u] << 24u) |
+                     ((uint32_t)src[src_size - 3u] << 16u) |
+                     ((uint32_t)src[src_size - 2u] << 8u) |
+                     (uint32_t)src[src_size - 1u];
+    if (rinz_adler32(dst, decoded_size) != expected_adler) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_DATA_ERROR;
+    }
+    if (out_size != NULL) *out_size = decoded_size;
+    return RINZ_OK;
 }
 
 /*
@@ -415,7 +478,7 @@ static inline int rinz_inflate(const uint8_t* src, size_t src_size,
  */
 static inline size_t rinz_inflate_bound(size_t src_size) {
     /* 最悪ケース: 非圧縮で少し増える */
-    return src_size * 1024;  /* 大きめに見積もる */
+    return src_size > (size_t)-1 / 1024u ? (size_t)-1 : src_size * 1024u;
 }
 
 #endif /* RINZ_H */
