@@ -50,21 +50,47 @@ static inline int rinz_bs_eof(RinzBitStream* bs) {
 }
 
 static inline uint32_t rinz_bs_peek(RinzBitStream* bs, int n) {
+    if (bs == NULL || n <= 0 || n > 24) return 0u;
     while (bs->bit_count < n && bs->src_pos < bs->src_size) {
         bs->bit_buf |= (uint32_t)bs->src[bs->src_pos++] << bs->bit_count;
         bs->bit_count += 8;
     }
+    if (bs->bit_count < n) return 0u;
     return bs->bit_buf & ((1u << n) - 1);
 }
 
 static inline void rinz_bs_skip(RinzBitStream* bs, int n) {
+    if (bs == NULL || n <= 0 || n > bs->bit_count) {
+        if (bs != NULL) {
+            bs->bit_buf = 0u;
+            bs->bit_count = 0;
+        }
+        return;
+    }
     bs->bit_buf >>= n;
     bs->bit_count -= n;
 }
 
+static inline int rinz_bs_read_checked(RinzBitStream* bs, int n,
+                                       uint32_t* value) {
+    if (bs == NULL || value == NULL || n <= 0 || n > 24) return 0;
+    while (bs->bit_count < n && bs->src_pos < bs->src_size) {
+        bs->bit_buf |= (uint32_t)bs->src[bs->src_pos++] << bs->bit_count;
+        bs->bit_count += 8;
+    }
+    if (bs->bit_count < n) {
+        *value = 0u;
+        return 0;
+    }
+    *value = bs->bit_buf & ((1u << n) - 1u);
+    bs->bit_buf >>= n;
+    bs->bit_count -= n;
+    return 1;
+}
+
 static inline uint32_t rinz_bs_read(RinzBitStream* bs, int n) {
-    uint32_t val = rinz_bs_peek(bs, n);
-    rinz_bs_skip(bs, n);
+    uint32_t val = 0u;
+    (void)rinz_bs_read_checked(bs, n, &val);
     return val;
 }
 
@@ -96,9 +122,19 @@ static inline int rinz_huff_build(RinzHuffTable* h, const uint8_t* lens, int n) 
     
     /* 各ビット長のコード数をカウント */
     for (int i = 0; i < n; i++) {
-        if (lens[i] > 0 && lens[i] < RINZ_MAX_BITS) {
+        if (lens[i] >= RINZ_MAX_BITS) return RINZ_DATA_ERROR;
+        if (lens[i] > 0) {
             h->counts[lens[i]]++;
         }
+    }
+
+    /* Reject an oversubscribed canonical tree.  Incomplete trees are
+     * permitted by DEFLATE for the distance alphabet, but a code may never
+     * consume more leaves than the prefix space provides. */
+    int left = 1;
+    for (int bits = 1; bits < RINZ_MAX_BITS; ++bits) {
+        left = (left << 1) - h->counts[bits];
+        if (left < 0) return RINZ_DATA_ERROR;
     }
     
     /* first[]とindex[]を計算 */
@@ -127,9 +163,11 @@ static inline int rinz_huff_build(RinzHuffTable* h, const uint8_t* lens, int n) 
 /* ハフマンデコード */
 static inline int rinz_huff_decode(RinzHuffTable* h, RinzBitStream* bs) {
     uint32_t code = 0;
-    
+
     for (int bits = 1; bits < RINZ_MAX_BITS; bits++) {
-        code = (code << 1) | rinz_bs_read(bs, 1);
+        uint32_t bit = 0u;
+        if (!rinz_bs_read_checked(bs, 1, &bit)) return -1;
+        code = (code << 1) | bit;
         
         if (h->counts[bits] > 0) {
             int first = h->first[bits];
@@ -257,7 +295,10 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
             
             int length = g_rinz_len_base[len_idx];
             if (g_rinz_len_extra[len_idx] > 0) {
-                length += rinz_bs_read(bs, g_rinz_len_extra[len_idx]);
+                uint32_t extra = 0u;
+                if (!rinz_bs_read_checked(bs, g_rinz_len_extra[len_idx],
+                                          &extra)) return RINZ_DATA_ERROR;
+                length += (int)extra;
             }
             
             int dist_sym = rinz_huff_decode(dist, bs);
@@ -265,7 +306,10 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
             
             int distance = g_rinz_dist_base[dist_sym];
             if (g_rinz_dist_extra[dist_sym] > 0) {
-                distance += rinz_bs_read(bs, g_rinz_dist_extra[dist_sym]);
+                uint32_t extra = 0u;
+                if (!rinz_bs_read_checked(bs, g_rinz_dist_extra[dist_sym],
+                                          &extra)) return RINZ_DATA_ERROR;
+                distance += (int)extra;
             }
             
             if (distance > (int)out->out_pos) return RINZ_DATA_ERROR;
@@ -286,20 +330,29 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
 /* 動的ハフマンテーブル読み込み */
 static inline int rinz_inflate_dynamic(RinzBitStream* bs, 
                                         RinzHuffTable* lit, RinzHuffTable* dist) {
-    int hlit = rinz_bs_read(bs, 5) + 257;
-    int hdist = rinz_bs_read(bs, 5) + 1;
-    int hclen = rinz_bs_read(bs, 4) + 4;
-    
-    if (hlit > 286 || hdist > 30) return RINZ_DATA_ERROR;
+    uint32_t value = 0u;
+    int hlit;
+    int hdist;
+    int hclen;
+    if (!rinz_bs_read_checked(bs, 5, &value)) return RINZ_DATA_ERROR;
+    hlit = (int)value + 257;
+    if (!rinz_bs_read_checked(bs, 5, &value)) return RINZ_DATA_ERROR;
+    hdist = (int)value + 1;
+    if (!rinz_bs_read_checked(bs, 4, &value)) return RINZ_DATA_ERROR;
+    hclen = (int)value + 4;
+
+    if (hlit > 286 || hdist > 32) return RINZ_DATA_ERROR;
     
     /* コード長のコード長を読む */
     uint8_t clen_lens[19] = {0};
     for (int i = 0; i < hclen; i++) {
-        clen_lens[g_rinz_clen_order[i]] = rinz_bs_read(bs, 3);
+        if (!rinz_bs_read_checked(bs, 3, &value)) return RINZ_DATA_ERROR;
+        clen_lens[g_rinz_clen_order[i]] = (uint8_t)value;
     }
     
     RinzHuffTable clen_huff;
-    rinz_huff_build(&clen_huff, clen_lens, 19);
+    if (rinz_huff_build(&clen_huff, clen_lens, 19) != RINZ_OK)
+        return RINZ_DATA_ERROR;
     
     /* リテラル/長さ + 距離のコード長を読む */
     uint8_t all_lens[320] = {0};
@@ -314,28 +367,42 @@ static inline int rinz_inflate_dynamic(RinzBitStream* bs,
             all_lens[idx++] = sym;
         } else if (sym == 16) {
             /* 直前の値を3-6回繰り返す */
-            int rep = rinz_bs_read(bs, 2) + 3;
-            uint8_t prev = (idx > 0) ? all_lens[idx - 1] : 0;
-            while (rep-- > 0 && idx < total) {
+            int rep;
+            uint8_t prev;
+            if (idx == 0 || !rinz_bs_read_checked(bs, 2, &value))
+                return RINZ_DATA_ERROR;
+            rep = (int)value + 3;
+            prev = all_lens[idx - 1];
+            if (rep > total - idx) return RINZ_DATA_ERROR;
+            while (rep-- > 0) {
                 all_lens[idx++] = prev;
             }
         } else if (sym == 17) {
             /* 0を3-10回繰り返す */
-            int rep = rinz_bs_read(bs, 3) + 3;
-            while (rep-- > 0 && idx < total) {
+            int rep;
+            if (!rinz_bs_read_checked(bs, 3, &value)) return RINZ_DATA_ERROR;
+            rep = (int)value + 3;
+            if (rep > total - idx) return RINZ_DATA_ERROR;
+            while (rep-- > 0) {
                 all_lens[idx++] = 0;
             }
-        } else { /* sym == 18 */
+        } else if (sym == 18) {
             /* 0を11-138回繰り返す */
-            int rep = rinz_bs_read(bs, 7) + 11;
-            while (rep-- > 0 && idx < total) {
+            int rep;
+            if (!rinz_bs_read_checked(bs, 7, &value)) return RINZ_DATA_ERROR;
+            rep = (int)value + 11;
+            if (rep > total - idx) return RINZ_DATA_ERROR;
+            while (rep-- > 0) {
                 all_lens[idx++] = 0;
             }
+        } else {
+            return RINZ_DATA_ERROR;
         }
     }
     
-    rinz_huff_build(lit, all_lens, hlit);
-    rinz_huff_build(dist, all_lens + hlit, hdist);
+    if (rinz_huff_build(lit, all_lens, hlit) != RINZ_OK ||
+        rinz_huff_build(dist, all_lens + hlit, hdist) != RINZ_OK)
+        return RINZ_DATA_ERROR;
     
     return RINZ_OK;
 }
@@ -356,6 +423,8 @@ static inline void rinz_clear_output(uint8_t* dst, size_t dst_size) {
 static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
                                          uint8_t* dst, size_t dst_size,
                                          size_t* out_size) {
+    if ((src == NULL && src_size != 0u) ||
+        (dst == NULL && dst_size != 0u)) return RINZ_ERROR;
     rinz_init_fixed_tables();
     
     RinzBitStream bs;
@@ -369,8 +438,12 @@ static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
     int final_block = 0;
     
     while (!final_block) {
-        final_block = rinz_bs_read(&bs, 1);
-        int btype = rinz_bs_read(&bs, 2);
+        uint32_t header = 0u;
+        uint32_t block_type = 0u;
+        if (!rinz_bs_read_checked(&bs, 1, &header) ||
+            !rinz_bs_read_checked(&bs, 2, &block_type)) return RINZ_DATA_ERROR;
+        final_block = (int)header;
+        int btype = (int)block_type;
         
         int ret;
         
