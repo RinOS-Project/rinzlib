@@ -14,10 +14,19 @@
  * ═══════════════════════════════════════════════════════════════*/
 
 static uint32_t g_rinz_crc32_table[256];
-static int g_rinz_crc32_init = 0;
+/* 0 = uninitialized, 1 = one caller is initializing, 2 = ready. */
+static int g_rinz_crc32_init_state = 0;
 
 static inline void rinz_crc32_init_table(void) {
-    if (g_rinz_crc32_init) return;
+    int expected = 0;
+    if (__atomic_load_n(&g_rinz_crc32_init_state, __ATOMIC_ACQUIRE) == 2)
+        return;
+    if (!__atomic_compare_exchange_n(&g_rinz_crc32_init_state, &expected, 1,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&g_rinz_crc32_init_state, __ATOMIC_ACQUIRE) != 2) {
+        }
+        return;
+    }
     
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
@@ -26,7 +35,7 @@ static inline void rinz_crc32_init_table(void) {
         }
         g_rinz_crc32_table[i] = c;
     }
-    g_rinz_crc32_init = 1;
+    __atomic_store_n(&g_rinz_crc32_init_state, 2, __ATOMIC_RELEASE);
 }
 
 static inline uint32_t rinz_crc32(const uint8_t* data, size_t len) {

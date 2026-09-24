@@ -184,28 +184,38 @@ static inline int rinz_huff_decode(RinzHuffTable* h, RinzBitStream* bs) {
  * 固定ハフマンテーブル
  * ═══════════════════════════════════════════════════════════════*/
 
-static uint8_t g_rinz_fixed_lit_lens[288];
-static uint8_t g_rinz_fixed_dist_lens[32];
 static RinzHuffTable g_rinz_fixed_lit;
 static RinzHuffTable g_rinz_fixed_dist;
-static int g_rinz_fixed_init = 0;
+/* 0 = uninitialized, 1 = one caller is initializing, 2 = ready. */
+static int g_rinz_fixed_init_state = 0;
 
 static inline void rinz_init_fixed_tables(void) {
-    if (g_rinz_fixed_init) return;
+    int expected = 0;
+    if (__atomic_load_n(&g_rinz_fixed_init_state, __ATOMIC_ACQUIRE) == 2)
+        return;
+    if (!__atomic_compare_exchange_n(&g_rinz_fixed_init_state, &expected, 1,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&g_rinz_fixed_init_state, __ATOMIC_ACQUIRE) != 2) {
+        }
+        return;
+    }
+
+    uint8_t fixed_lit_lens[288];
+    uint8_t fixed_dist_lens[32];
     
     /* リテラル/長さ (RFC 1951) */
-    for (int i = 0; i < 144; i++) g_rinz_fixed_lit_lens[i] = 8;
-    for (int i = 144; i < 256; i++) g_rinz_fixed_lit_lens[i] = 9;
-    for (int i = 256; i < 280; i++) g_rinz_fixed_lit_lens[i] = 7;
-    for (int i = 280; i < 288; i++) g_rinz_fixed_lit_lens[i] = 8;
+    for (int i = 0; i < 144; i++) fixed_lit_lens[i] = 8;
+    for (int i = 144; i < 256; i++) fixed_lit_lens[i] = 9;
+    for (int i = 256; i < 280; i++) fixed_lit_lens[i] = 7;
+    for (int i = 280; i < 288; i++) fixed_lit_lens[i] = 8;
     
     /* 距離 */
-    for (int i = 0; i < 32; i++) g_rinz_fixed_dist_lens[i] = 5;
+    for (int i = 0; i < 32; i++) fixed_dist_lens[i] = 5;
     
-    rinz_huff_build(&g_rinz_fixed_lit, g_rinz_fixed_lit_lens, 288);
-    rinz_huff_build(&g_rinz_fixed_dist, g_rinz_fixed_dist_lens, 32);
+    rinz_huff_build(&g_rinz_fixed_lit, fixed_lit_lens, 288);
+    rinz_huff_build(&g_rinz_fixed_dist, fixed_dist_lens, 32);
     
-    g_rinz_fixed_init = 1;
+    __atomic_store_n(&g_rinz_fixed_init_state, 2, __ATOMIC_RELEASE);
 }
 
 /* ═══════════════════════════════════════════════════════════════
