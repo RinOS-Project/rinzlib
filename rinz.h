@@ -22,6 +22,7 @@
 #define RINZ_DATA_ERROR    -2
 #define RINZ_BUF_ERROR     -3
 #define RINZ_LIMIT_ERROR   -4
+#define RINZ_DEADLINE_ERROR -5
 
 #define RINZ_MAX_WBITS     15
 #define RINZ_WINDOW_SIZE   (1 << RINZ_MAX_WBITS)  /* 32KB */
@@ -36,6 +37,15 @@ typedef struct {
     size_t max_output_bytes;
     size_t max_blocks;
 } RinzInflateLimits;
+
+/* Return non-zero when the caller-owned monotonic deadline has expired.  The
+ * callback must be cheap and must not mutate the inflate buffers. */
+typedef int (*RinzInflateDeadlineFunction)(void* context);
+
+static inline int rinz_deadline_expired(RinzInflateDeadlineFunction deadline,
+                                         void* context) {
+    return deadline != NULL && deadline(context) != 0;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * ビットストリーム
@@ -269,10 +279,15 @@ typedef struct {
     size_t   out_size;
     size_t   out_pos;
     size_t   max_output_size;
+    RinzInflateDeadlineFunction deadline;
+    void*    deadline_context;
 } RinzOutput;
 
 static inline int rinz_output_reserve(RinzOutput* out, size_t amount) {
-    if (out == NULL || out->out_pos > out->out_size ||
+    if (out == NULL) return RINZ_ERROR;
+    if (rinz_deadline_expired(out->deadline, out->deadline_context))
+        return RINZ_DEADLINE_ERROR;
+    if (out->out_pos > out->out_size ||
         amount > out->out_size - out->out_pos) return RINZ_BUF_ERROR;
     if (out->out_pos > out->max_output_size ||
         amount > out->max_output_size - out->out_pos) return RINZ_LIMIT_ERROR;
@@ -299,6 +314,9 @@ static inline int rinz_inflate_stored(RinzBitStream* bs, RinzOutput* out) {
     if (reserve_result != RINZ_OK) return reserve_result;
     
     for (uint16_t i = 0; i < len; i++) {
+        if ((i & 0xfffu) == 0u &&
+            rinz_deadline_expired(out->deadline, out->deadline_context))
+            return RINZ_DEADLINE_ERROR;
         out->out[out->out_pos++] = bs->src[bs->src_pos++];
     }
     
@@ -351,6 +369,10 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
             
             /* バックリファレンスコピー */
             for (int i = 0; i < length; i++) {
+                if ((i & 0x3f) == 0 &&
+                    rinz_deadline_expired(out->deadline,
+                                          out->deadline_context))
+                    return RINZ_DEADLINE_ERROR;
                 out->out[out->out_pos] = out->out[out->out_pos - distance];
                 out->out_pos++;
             }
@@ -361,12 +383,16 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
 }
 
 /* 動的ハフマンテーブル読み込み */
-static inline int rinz_inflate_dynamic(RinzBitStream* bs, 
-                                        RinzHuffTable* lit, RinzHuffTable* dist) {
+static inline int rinz_inflate_dynamic(RinzBitStream* bs,
+                                        RinzHuffTable* lit, RinzHuffTable* dist,
+                                        RinzInflateDeadlineFunction deadline,
+                                        void* deadline_context) {
     uint32_t value = 0u;
     int hlit;
     int hdist;
     int hclen;
+    if (rinz_deadline_expired(deadline, deadline_context))
+        return RINZ_DEADLINE_ERROR;
     if (!rinz_bs_read_checked(bs, 5, &value)) return RINZ_DATA_ERROR;
     hlit = (int)value + 257;
     if (!rinz_bs_read_checked(bs, 5, &value)) return RINZ_DATA_ERROR;
@@ -393,6 +419,8 @@ static inline int rinz_inflate_dynamic(RinzBitStream* bs,
     int total = hlit + hdist;
     
     while (idx < total) {
+        if (rinz_deadline_expired(deadline, deadline_context))
+            return RINZ_DEADLINE_ERROR;
         int sym = rinz_huff_decode(&clen_huff, bs);
         if (sym < 0) return RINZ_DATA_ERROR;
         
@@ -456,10 +484,14 @@ static inline void rinz_clear_output(uint8_t* dst, size_t dst_size) {
 static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
                                          uint8_t* dst, size_t dst_size,
                                          size_t* out_size,
-                                         const RinzInflateLimits* limits) {
+                                         const RinzInflateLimits* limits,
+                                         RinzInflateDeadlineFunction deadline,
+                                         void* deadline_context) {
     if ((src == NULL && src_size != 0u) ||
         (dst == NULL && dst_size != 0u) || limits == NULL) return RINZ_ERROR;
     if (src_size > limits->max_input_bytes) return RINZ_LIMIT_ERROR;
+    if (rinz_deadline_expired(deadline, deadline_context))
+        return RINZ_DEADLINE_ERROR;
     rinz_init_fixed_tables();
     
     RinzBitStream bs;
@@ -470,6 +502,8 @@ static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
     out.out_size = dst_size;
     out.out_pos = 0;
     out.max_output_size = limits->max_output_bytes;
+    out.deadline = deadline;
+    out.deadline_context = deadline_context;
     
     int final_block = 0;
     size_t block_count = 0u;
@@ -477,6 +511,8 @@ static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
     while (!final_block) {
         uint32_t header = 0u;
         uint32_t block_type = 0u;
+        if (rinz_deadline_expired(deadline, deadline_context))
+            return RINZ_DEADLINE_ERROR;
         if (limits->max_blocks != RINZ_LIMIT_UNBOUNDED &&
             block_count >= limits->max_blocks) return RINZ_LIMIT_ERROR;
         ++block_count;
@@ -496,7 +532,8 @@ static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
         } else if (btype == 2) {
             /* 動的ハフマン */
             RinzHuffTable lit, dist;
-            ret = rinz_inflate_dynamic(&bs, &lit, &dist);
+            ret = rinz_inflate_dynamic(&bs, &lit, &dist, deadline,
+                                       deadline_context);
             if (ret != RINZ_OK) return ret;
             ret = rinz_inflate_block(&bs, &out, &lit, &dist);
         } else {
@@ -510,10 +547,10 @@ static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
     return RINZ_OK;
 }
 
-static inline int rinz_inflate_raw_limited(const uint8_t* src, size_t src_size,
-                                           uint8_t* dst, size_t dst_size,
-                                           size_t* out_size,
-                                           const RinzInflateLimits* limits) {
+static inline int rinz_inflate_raw_limited_with_deadline(
+    const uint8_t* src, size_t src_size, uint8_t* dst, size_t dst_size,
+    size_t* out_size, const RinzInflateLimits* limits,
+    RinzInflateDeadlineFunction deadline, void* deadline_context) {
     int result;
     if (out_size != NULL) *out_size = 0u;
     if ((src == NULL && src_size != 0u) ||
@@ -522,12 +559,20 @@ static inline int rinz_inflate_raw_limited(const uint8_t* src, size_t src_size,
         return RINZ_ERROR;
     }
     result = rinz_inflate_raw_impl(src, src_size, dst, dst_size, out_size,
-                                   limits);
+                                   limits, deadline, deadline_context);
     if (result != RINZ_OK) {
         if (out_size != NULL) *out_size = 0u;
         rinz_clear_output(dst, dst_size);
     }
     return result;
+}
+
+static inline int rinz_inflate_raw_limited(const uint8_t* src, size_t src_size,
+                                           uint8_t* dst, size_t dst_size,
+                                           size_t* out_size,
+                                           const RinzInflateLimits* limits) {
+    return rinz_inflate_raw_limited_with_deadline(
+        src, src_size, dst, dst_size, out_size, limits, NULL, NULL);
 }
 
 static inline int rinz_inflate_raw(const uint8_t* src, size_t src_size,
@@ -545,10 +590,10 @@ static inline int rinz_inflate_raw(const uint8_t* src, size_t src_size,
 /*
  * zlib形式展開 (2バイトヘッダー付き)
  */
-static inline int rinz_inflate_limited(const uint8_t* src, size_t src_size,
-                                       uint8_t* dst, size_t dst_size,
-                                       size_t* out_size,
-                                       const RinzInflateLimits* limits) {
+static inline int rinz_inflate_limited_with_deadline(
+    const uint8_t* src, size_t src_size, uint8_t* dst, size_t dst_size,
+    size_t* out_size, const RinzInflateLimits* limits,
+    RinzInflateDeadlineFunction deadline, void* deadline_context) {
     size_t offset = 2u;
     size_t payload_size;
     size_t decoded_size = 0u;
@@ -563,6 +608,10 @@ static inline int rinz_inflate_limited(const uint8_t* src, size_t src_size,
     if (src_size > limits->max_input_bytes) {
         rinz_clear_output(dst, dst_size);
         return RINZ_LIMIT_ERROR;
+    }
+    if (rinz_deadline_expired(deadline, deadline_context)) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_DEADLINE_ERROR;
     }
     
     /* zlibヘッダー確認 */
@@ -590,7 +639,8 @@ static inline int rinz_inflate_limited(const uint8_t* src, size_t src_size,
     }
     payload_size = src_size - offset - 4u;
     result = rinz_inflate_raw_impl(src + offset, payload_size, dst, dst_size,
-                                   &decoded_size, limits);
+                                   &decoded_size, limits, deadline,
+                                   deadline_context);
     if (result != RINZ_OK) {
         if (out_size != NULL) *out_size = 0u;
         rinz_clear_output(dst, dst_size);
@@ -606,6 +656,14 @@ static inline int rinz_inflate_limited(const uint8_t* src, size_t src_size,
     }
     if (out_size != NULL) *out_size = decoded_size;
     return RINZ_OK;
+}
+
+static inline int rinz_inflate_limited(const uint8_t* src, size_t src_size,
+                                       uint8_t* dst, size_t dst_size,
+                                       size_t* out_size,
+                                       const RinzInflateLimits* limits) {
+    return rinz_inflate_limited_with_deadline(
+        src, src_size, dst, dst_size, out_size, limits, NULL, NULL);
 }
 
 static inline int rinz_inflate(const uint8_t* src, size_t src_size,
