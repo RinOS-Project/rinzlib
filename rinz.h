@@ -363,7 +363,7 @@ static inline int rinz_inflate_block(RinzBitStream* bs, RinzOutput* out,
                 distance += (int)extra;
             }
             
-            if (distance > (int)out->out_pos) return RINZ_DATA_ERROR;
+            if ((size_t)distance > out->out_pos) return RINZ_DATA_ERROR;
             reserve_result = rinz_output_reserve(out, (size_t)length);
             if (reserve_result != RINZ_OK) return reserve_result;
             
