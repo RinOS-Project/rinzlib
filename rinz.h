@@ -542,6 +542,11 @@ static inline int rinz_inflate_raw_impl(const uint8_t* src, size_t src_size,
         
         if (ret != RINZ_OK) return ret;
     }
+
+    /* A single raw DEFLATE stream must consume all complete input bytes.
+     * Unused alignment bits in the final byte are permitted, but trailing
+     * bytes would make a zlib payload ambiguous and must fail closed. */
+    if (bs.src_pos != bs.src_size) return RINZ_DATA_ERROR;
     
     if (out_size) *out_size = out.out_pos;
     return RINZ_OK;
