@@ -2,7 +2,8 @@
  * RinOS zlib ✿
  * 軽量deflate/inflate実装
  * 
- * RFC 1950 (zlib), RFC 1951 (deflate) 準拠
+ * RFC 1950 (zlib), RFC 1951 (deflate), and bounded RFC 1952 (gzip)
+ * single-member decoding.
  */
 
 #ifndef RINZ_H
@@ -681,6 +682,153 @@ static inline int rinz_inflate(const uint8_t* src, size_t src_size,
     };
     return rinz_inflate_limited(src, src_size, dst, dst_size, out_size,
                                 &limits);
+}
+
+/*
+ * Bounded gzip member decode (RFC 1952).
+ *
+ * This public adapter deliberately accepts one member only.  It validates all
+ * optional header fields, including FHCRC, then delegates the raw DEFLATE
+ * member to the same bounded decoder used by the zlib API.  The trailer CRC32
+ * and modulo-2^32 ISIZE are checked before any output is published.  A caller
+ * that needs concatenated members should process each member through a
+ * dedicated archive/container reader, not infer member boundaries here.
+ */
+static inline int rinz_gzip_find_terminated_field(
+    const uint8_t* src, size_t src_size, size_t* offset,
+    RinzInflateDeadlineFunction deadline, void* deadline_context) {
+    if (src == NULL || offset == NULL || *offset > src_size)
+        return RINZ_ERROR;
+    while (*offset < src_size) {
+        if (rinz_deadline_expired(deadline, deadline_context))
+            return RINZ_DEADLINE_ERROR;
+        if (src[*offset] == 0u) {
+            ++*offset;
+            return RINZ_OK;
+        }
+        ++*offset;
+    }
+    return RINZ_DATA_ERROR;
+}
+
+static inline int rinz_gzip_inflate_impl(
+    const uint8_t* src, size_t src_size, uint8_t* dst, size_t dst_size,
+    size_t* out_size, const RinzInflateLimits* limits,
+    RinzInflateDeadlineFunction deadline, void* deadline_context) {
+    size_t offset = 10u;
+    size_t payload_size;
+    size_t decoded_size = 0u;
+    uint8_t flags;
+    uint32_t expected_crc;
+    uint32_t expected_size;
+    int result;
+
+    if ((src == NULL && src_size != 0u) ||
+        (dst == NULL && dst_size != 0u) || limits == NULL)
+        return RINZ_ERROR;
+    if (src_size > limits->max_input_bytes) return RINZ_LIMIT_ERROR;
+    if (src_size < 18u) return RINZ_DATA_ERROR;
+    if (rinz_deadline_expired(deadline, deadline_context))
+        return RINZ_DEADLINE_ERROR;
+    if (src[0] != 0x1fu || src[1] != 0x8bu || src[2] != 8u)
+        return RINZ_DATA_ERROR;
+    flags = src[3];
+    if ((flags & 0xe0u) != 0u) return RINZ_DATA_ERROR;
+
+    if ((flags & 0x04u) != 0u) {
+        uint16_t extra_size;
+        if (offset > src_size || src_size - offset < 2u)
+            return RINZ_DATA_ERROR;
+        extra_size = (uint16_t)src[offset] |
+                     (uint16_t)((uint16_t)src[offset + 1u] << 8u);
+        offset += 2u;
+        if ((size_t)extra_size > src_size - offset)
+            return RINZ_DATA_ERROR;
+        offset += (size_t)extra_size;
+    }
+    if ((flags & 0x08u) != 0u) {
+        result = rinz_gzip_find_terminated_field(
+            src, src_size, &offset, deadline, deadline_context);
+        if (result != RINZ_OK) return result;
+    }
+    if ((flags & 0x10u) != 0u) {
+        result = rinz_gzip_find_terminated_field(
+            src, src_size, &offset, deadline, deadline_context);
+        if (result != RINZ_OK) return result;
+    }
+    if ((flags & 0x02u) != 0u) {
+        uint16_t expected_header_crc;
+        uint16_t actual_header_crc;
+        if (offset > src_size || src_size - offset < 2u)
+            return RINZ_DATA_ERROR;
+        expected_header_crc = (uint16_t)src[offset] |
+                              (uint16_t)((uint16_t)src[offset + 1u] << 8u);
+        actual_header_crc = (uint16_t)(rinz_crc32(src, offset) & 0xffffu);
+        if (actual_header_crc != expected_header_crc)
+            return RINZ_DATA_ERROR;
+        offset += 2u;
+    }
+    if (offset > src_size || src_size - offset < 8u)
+        return RINZ_DATA_ERROR;
+    payload_size = src_size - offset - 8u;
+    result = rinz_inflate_raw_impl(src + offset, payload_size, dst, dst_size,
+                                   &decoded_size, limits, deadline,
+                                   deadline_context);
+    if (result != RINZ_OK) return result;
+    if (rinz_deadline_expired(deadline, deadline_context))
+        return RINZ_DEADLINE_ERROR;
+    expected_crc = (uint32_t)src[src_size - 8u] |
+                   ((uint32_t)src[src_size - 7u] << 8u) |
+                   ((uint32_t)src[src_size - 6u] << 16u) |
+                   ((uint32_t)src[src_size - 5u] << 24u);
+    expected_size = (uint32_t)src[src_size - 4u] |
+                    ((uint32_t)src[src_size - 3u] << 8u) |
+                    ((uint32_t)src[src_size - 2u] << 16u) |
+                    ((uint32_t)src[src_size - 1u] << 24u);
+    if (rinz_crc32(dst, decoded_size) != expected_crc ||
+        (uint32_t)decoded_size != expected_size)
+        return RINZ_DATA_ERROR;
+    if (out_size != NULL) *out_size = decoded_size;
+    return RINZ_OK;
+}
+
+static inline int rinz_gzip_inflate_limited_with_deadline(
+    const uint8_t* src, size_t src_size, uint8_t* dst, size_t dst_size,
+    size_t* out_size, const RinzInflateLimits* limits,
+    RinzInflateDeadlineFunction deadline, void* deadline_context) {
+    int result;
+    if (out_size != NULL) *out_size = 0u;
+    if ((src == NULL && src_size != 0u) ||
+        (dst == NULL && dst_size != 0u) || limits == NULL) {
+        rinz_clear_output(dst, dst_size);
+        return RINZ_ERROR;
+    }
+    result = rinz_gzip_inflate_impl(src, src_size, dst, dst_size, out_size,
+                                    limits, deadline, deadline_context);
+    if (result != RINZ_OK) {
+        if (out_size != NULL) *out_size = 0u;
+        rinz_clear_output(dst, dst_size);
+    }
+    return result;
+}
+
+static inline int rinz_gzip_inflate_limited(
+    const uint8_t* src, size_t src_size, uint8_t* dst, size_t dst_size,
+    size_t* out_size, const RinzInflateLimits* limits) {
+    return rinz_gzip_inflate_limited_with_deadline(
+        src, src_size, dst, dst_size, out_size, limits, NULL, NULL);
+}
+
+static inline int rinz_gzip_inflate(const uint8_t* src, size_t src_size,
+                                    uint8_t* dst, size_t dst_size,
+                                    size_t* out_size) {
+    const RinzInflateLimits limits = {
+        RINZ_LIMIT_UNBOUNDED,
+        RINZ_LIMIT_UNBOUNDED,
+        RINZ_LIMIT_UNBOUNDED
+    };
+    return rinz_gzip_inflate_limited(src, src_size, dst, dst_size, out_size,
+                                     &limits);
 }
 
 /*
