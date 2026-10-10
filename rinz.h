@@ -48,6 +48,49 @@ static inline int rinz_deadline_expired(RinzInflateDeadlineFunction deadline,
     return deadline != NULL && deadline(context) != 0;
 }
 
+/* Check long output checksums in bounded slices as well as during decode.
+ * 4 KiB keeps deadline polling overhead low while preventing a large Adler32
+ * or CRC32 pass from becoming one uninterruptible CPU interval. */
+#define RINZ_DEADLINE_CHECK_INTERVAL 4096u
+
+static inline int rinz_crc32_with_deadline(
+    const uint8_t* data, size_t length, uint32_t* checksum_out,
+    RinzInflateDeadlineFunction deadline, void* context) {
+    uint32_t checksum = UINT32_C(0xffffffff);
+
+    if (!checksum_out || (!data && length != 0u)) return RINZ_ERROR;
+    rinz_crc32_init_table();
+    for (size_t index = 0u; index < length; ++index) {
+        if ((index % RINZ_DEADLINE_CHECK_INTERVAL) == 0u &&
+            rinz_deadline_expired(deadline, context))
+            return RINZ_DEADLINE_ERROR;
+        checksum = g_rinz_crc32_table[(checksum ^ data[index]) & 0xffu] ^
+                   (checksum >> 8u);
+    }
+    if (rinz_deadline_expired(deadline, context)) return RINZ_DEADLINE_ERROR;
+    *checksum_out = checksum ^ UINT32_C(0xffffffff);
+    return RINZ_OK;
+}
+
+static inline int rinz_adler32_with_deadline(
+    const uint8_t* data, size_t length, uint32_t* checksum_out,
+    RinzInflateDeadlineFunction deadline, void* context) {
+    uint32_t a = 1u;
+    uint32_t b = 0u;
+
+    if (!checksum_out || (!data && length != 0u)) return RINZ_ERROR;
+    for (size_t index = 0u; index < length; ++index) {
+        if ((index % RINZ_DEADLINE_CHECK_INTERVAL) == 0u &&
+            rinz_deadline_expired(deadline, context))
+            return RINZ_DEADLINE_ERROR;
+        a = (a + data[index]) % RINZ_ADLER_BASE;
+        b = (b + a) % RINZ_ADLER_BASE;
+    }
+    if (rinz_deadline_expired(deadline, context)) return RINZ_DEADLINE_ERROR;
+    *checksum_out = (b << 16u) | a;
+    return RINZ_OK;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * ビットストリーム
  * ═══════════════════════════════════════════════════════════════*/
@@ -604,6 +647,7 @@ static inline int rinz_inflate_limited_with_deadline(
     size_t payload_size;
     size_t decoded_size = 0u;
     uint32_t expected_adler;
+    uint32_t actual_adler;
     int result;
     if (out_size != NULL) *out_size = 0u;
     if (src == NULL || src_size < 6u ||
@@ -656,7 +700,13 @@ static inline int rinz_inflate_limited_with_deadline(
                      ((uint32_t)src[src_size - 3u] << 16u) |
                      ((uint32_t)src[src_size - 2u] << 8u) |
                      (uint32_t)src[src_size - 1u];
-    if (rinz_adler32(dst, decoded_size) != expected_adler) {
+    result = rinz_adler32_with_deadline(dst, decoded_size, &actual_adler,
+                                        deadline, deadline_context);
+    if (result != RINZ_OK) {
+        rinz_clear_output(dst, dst_size);
+        return result;
+    }
+    if (actual_adler != expected_adler) {
         rinz_clear_output(dst, dst_size);
         return RINZ_DATA_ERROR;
     }
@@ -720,6 +770,7 @@ static inline int rinz_gzip_inflate_impl(
     size_t decoded_size = 0u;
     uint8_t flags;
     uint32_t expected_crc;
+    uint32_t actual_crc;
     uint32_t expected_size;
     int result;
 
@@ -758,13 +809,15 @@ static inline int rinz_gzip_inflate_impl(
     }
     if ((flags & 0x02u) != 0u) {
         uint16_t expected_header_crc;
-        uint16_t actual_header_crc;
+        uint32_t actual_header_crc;
         if (offset > src_size || src_size - offset < 2u)
             return RINZ_DATA_ERROR;
         expected_header_crc = (uint16_t)src[offset] |
                               (uint16_t)((uint16_t)src[offset + 1u] << 8u);
-        actual_header_crc = (uint16_t)(rinz_crc32(src, offset) & 0xffffu);
-        if (actual_header_crc != expected_header_crc)
+        result = rinz_crc32_with_deadline(src, offset, &actual_header_crc,
+                                          deadline, deadline_context);
+        if (result != RINZ_OK) return result;
+        if ((uint16_t)(actual_header_crc & 0xffffu) != expected_header_crc)
             return RINZ_DATA_ERROR;
         offset += 2u;
     }
@@ -785,7 +838,10 @@ static inline int rinz_gzip_inflate_impl(
                     ((uint32_t)src[src_size - 3u] << 8u) |
                     ((uint32_t)src[src_size - 2u] << 16u) |
                     ((uint32_t)src[src_size - 1u] << 24u);
-    if (rinz_crc32(dst, decoded_size) != expected_crc ||
+    result = rinz_crc32_with_deadline(dst, decoded_size, &actual_crc,
+                                      deadline, deadline_context);
+    if (result != RINZ_OK) return result;
+    if (actual_crc != expected_crc ||
         (uint32_t)decoded_size != expected_size)
         return RINZ_DATA_ERROR;
     if (out_size != NULL) *out_size = decoded_size;
