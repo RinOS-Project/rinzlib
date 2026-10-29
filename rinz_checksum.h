@@ -63,27 +63,45 @@ static inline uint32_t rinz_crc32_update(uint32_t crc, const uint8_t* data, size
  * ═══════════════════════════════════════════════════════════════*/
 
 #define RINZ_ADLER_BASE 65521
+/* The largest block for which the unmodded Adler sums fit in uint32_t. */
+enum { RINZ_ADLER_BLOCK_MAX = 5552u };
 
 static inline uint32_t rinz_adler32(const uint8_t* data, size_t len) {
     uint32_t a = 1, b = 0;
-    
-    for (size_t i = 0; i < len; i++) {
-        a = (a + data[i]) % RINZ_ADLER_BASE;
-        b = (b + a) % RINZ_ADLER_BASE;
+
+    while (len != 0u) {
+        const size_t block = len > RINZ_ADLER_BLOCK_MAX
+            ? RINZ_ADLER_BLOCK_MAX : len;
+        for (size_t i = 0u; i < block; ++i) {
+            a += data[i];
+            b += a;
+        }
+        a %= RINZ_ADLER_BASE;
+        b %= RINZ_ADLER_BASE;
+        data += block;
+        len -= block;
     }
-    
+
     return (b << 16) | a;
 }
 
 static inline uint32_t rinz_adler32_update(uint32_t adler, const uint8_t* data, size_t len) {
     uint32_t a = adler & 0xFFFF;
     uint32_t b = (adler >> 16) & 0xFFFF;
-    
-    for (size_t i = 0; i < len; i++) {
-        a = (a + data[i]) % RINZ_ADLER_BASE;
-        b = (b + a) % RINZ_ADLER_BASE;
+
+    while (len != 0u) {
+        const size_t block = len > RINZ_ADLER_BLOCK_MAX
+            ? RINZ_ADLER_BLOCK_MAX : len;
+        for (size_t i = 0u; i < block; ++i) {
+            a += data[i];
+            b += a;
+        }
+        a %= RINZ_ADLER_BASE;
+        b %= RINZ_ADLER_BASE;
+        data += block;
+        len -= block;
     }
-    
+
     return (b << 16) | a;
 }
 

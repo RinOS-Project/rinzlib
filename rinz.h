@@ -77,14 +77,31 @@ static inline int rinz_adler32_with_deadline(
     RinzInflateDeadlineFunction deadline, void* context) {
     uint32_t a = 1u;
     uint32_t b = 0u;
+    size_t offset = 0u;
 
     if (!checksum_out || (!data && length != 0u)) return RINZ_ERROR;
-    for (size_t index = 0u; index < length; ++index) {
-        if ((index % RINZ_DEADLINE_CHECK_INTERVAL) == 0u &&
-            rinz_deadline_expired(deadline, context))
-            return RINZ_DEADLINE_ERROR;
-        a = (a + data[index]) % RINZ_ADLER_BASE;
-        b = (b + a) % RINZ_ADLER_BASE;
+    while (offset < length) {
+        const size_t remaining = length - offset;
+        const size_t block = remaining > RINZ_ADLER_BLOCK_MAX
+            ? RINZ_ADLER_BLOCK_MAX : remaining;
+        size_t block_offset = 0u;
+        while (block_offset < block) {
+            const size_t segment_remaining = block - block_offset;
+            const size_t segment =
+                segment_remaining > RINZ_DEADLINE_CHECK_INTERVAL
+                    ? RINZ_DEADLINE_CHECK_INTERVAL : segment_remaining;
+            const size_t segment_end = block_offset + segment;
+            if (rinz_deadline_expired(deadline, context))
+                return RINZ_DEADLINE_ERROR;
+            while (block_offset < segment_end) {
+                a += data[offset + block_offset];
+                b += a;
+                ++block_offset;
+            }
+        }
+        a %= RINZ_ADLER_BASE;
+        b %= RINZ_ADLER_BASE;
+        offset += block;
     }
     if (rinz_deadline_expired(deadline, context)) return RINZ_DEADLINE_ERROR;
     *checksum_out = (b << 16u) | a;
