@@ -57,15 +57,19 @@ static inline int rinz_crc32_with_deadline(
     const uint8_t* data, size_t length, uint32_t* checksum_out,
     RinzInflateDeadlineFunction deadline, void* context) {
     uint32_t checksum = UINT32_C(0xffffffff);
+    size_t bytes_until_deadline_check = 0u;
 
     if (!checksum_out || (!data && length != 0u)) return RINZ_ERROR;
     rinz_crc32_init_table();
     for (size_t index = 0u; index < length; ++index) {
-        if ((index % RINZ_DEADLINE_CHECK_INTERVAL) == 0u &&
-            rinz_deadline_expired(deadline, context))
-            return RINZ_DEADLINE_ERROR;
+        if (bytes_until_deadline_check == 0u) {
+            if (rinz_deadline_expired(deadline, context))
+                return RINZ_DEADLINE_ERROR;
+            bytes_until_deadline_check = RINZ_DEADLINE_CHECK_INTERVAL;
+        }
         checksum = g_rinz_crc32_table[(checksum ^ data[index]) & 0xffu] ^
                    (checksum >> 8u);
+        --bytes_until_deadline_check;
     }
     if (rinz_deadline_expired(deadline, context)) return RINZ_DEADLINE_ERROR;
     *checksum_out = checksum ^ UINT32_C(0xffffffff);
